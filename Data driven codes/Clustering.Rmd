@@ -1,0 +1,351 @@
+---
+title: "Clustering"
+author: "Vrinda Dhingra"
+date: "2025-08-28"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Loading required libraries
+
+```{r}
+
+#Packages/Libraries to include
+
+library(stats)
+library(readxl)
+library(nnls)
+library(writexl)
+library(CVXR)
+library(gurobi) 
+library(dplyr)
+library(cluster)
+library(dendextend)
+library(urca) 
+
+```
+
+
+Loading the Price data for the index and its constituents. 
+Calculating returns and defining the Asset Returns matrix and Index returns series.
+Specifying the rolling window parameters. 
+We choose one year in-sample and 3 months out-of-sample for our analysis. 
+
+
+```{r}
+
+#Data call
+
+Price_data<-read_excel("......mention file path to load asset price data here....") 
+Price_data<-as.matrix(Price_data)
+Price_data<-Price_data[, -c(1)] # for removing the dates column 
+
+price_row<-nrow(Price_data)-1
+price_col<-ncol(Price_data)
+
+num_price=as.numeric(Price_data)
+Price.mat=matrix(c(num_price), nrow=price_row+1, ncol=price_col, byrow=F)
+
+#Calculating Simple Returns
+
+Ret_data<-matrix(nrow=price_row, ncol=price_col)
+for(j in 1:price_col)
+{
+for(i in 1:price_row)
+  {
+    Ret_data[i,j]=(Price.mat[i+1,j]-Price.mat[i,j])/Price.mat[i,j]
+  }
+}
+
+#Defining Index and Asset returns from Returns matrix
+
+Ind_Ret<-Ret_data[, c(1)]
+Ast_Ret<-Ret_data[, c(2:price_col)]
+
+#Total number of assets
+N=ncol(Ast_Ret)
+
+#Total number of scenarios
+T=nrow(Ast_Ret)
+
+#cardinality and size bounds 
+K=45
+
+#Rolling_window strategy
+in_sample=21*24
+out_sample=21*3
+roll=21*3
+win_count=floor((T-in_sample-out_sample)/roll)+1
+
+```
+
+
+Declaring output matrices to store the portfolio weights from different models
+
+
+```{r}
+
+#OUTPUT MATRICES
+
+W1=matrix(0, win_count, N) 
+W2=matrix(0, win_count, N) 
+
+```
+
+
+```{r}
+
+# MSE based tracking error minimization function to generate optimal portfolio after getting the selected assets from clustering 
+
+mse_opt <- function(asset_ret, index_ret) {
+  #' Minimize tracking error via quadratic programming.
+  #'
+  #' Solves:  min_w || index_ret – asset_ret %*% w ||^2
+  #' Subject to:  sum(w) == 1,  w >= 0
+  #'
+  #' Parameters
+  #' ----------
+  #' asset_ret : matrix (T × N)
+  #'   Matrix of asset returns (T time periods × N assets).
+  #' index_ret : vector (T)
+  #'   Vector of benchmark (index) returns.
+  #'
+  #' Returns
+  #' -------
+  #' numeric vector (N)
+  #'   Optimal portfolio weights for N assets.
+  #'
+  #' Notes
+  #' -----
+  #' Uses CVXR to solve a convex quadratic program. If no solution is found,
+  #' returns a zero-weight vector and issues a warning.
+  # -----------------------------------------------------------------
+  
+  
+  # Ensure input formats are numeric matrices/vectors
+  asset_ret <- as.matrix(asset_ret)
+  index_ret <- as.numeric(index_ret)
+  
+  # Number of assets
+  N <- ncol(asset_ret)
+  
+  # Solve: min_w || index_ret - asset_ret %*% w ||^2
+  # Subject to: sum(w) == 1, w >= 0
+  
+  library(CVXR)
+  
+  w <- Variable(N)
+  objective <- Minimize(sum_squares(index_ret - asset_ret %*% w))
+  constraints <- list(w >= 0, sum(w) == 1)
+  
+  problem <- Problem(objective, constraints)
+  result <- solve(problem)
+  
+  if (result$status == "optimal") {
+    return(as.numeric(result$getValue(w)))
+  } else {
+    warning(paste("Optimization failed with status:", result$status))
+    return(rep(0, N))  # fallback: zero weights
+  }
+}
+
+
+#Clustering:1 Cutting into K clusters and selecting one asset at random from each cluster
+
+
+clust1<-function(AR, IR, L)
+{
+  #' Hierarchical clustering with equal representation.
+  #'
+  #' Forms L clusters of assets using correlation distance and complete linkage.
+  #' From each cluster, one asset is randomly selected, ensuring equal representation across all clusters.
+  #' Portfolio weights for the selected assets are then computed using mse_opt, and assigned back to the full set of assets.
+  #' 
+  #' Parameters
+  #' ----------
+  #' AR : matrix (T × N)
+  #'   Asset returns.
+  #' IR : vector (T)
+  #'   Index returns.
+  #' L : integer
+  #'   Number of clusters to form.
+  #'
+  #' Returns
+  #' -------
+  #' numeric vector (N)
+  #'   Portfolio weights across all assets, with non-zero weights only for
+  #'   the assets selected from each cluster.
+  # -----------------------------------------------------------------
+  
+returns_data=as.data.frame(AR)
+returns_data<-returns_data + rnorm(nrow(returns_data), mean = 0, sd = 1e-6)
+
+# Calculate correlation matrix
+correlation_matrix<-cor(returns_data)
+
+# Calculate distance matrix using correlation distance
+distance_matrix<-as.dist(sqrt(2 * (1 - correlation_matrix)))
+
+# Perform hierarchical clustering with complete linkage
+clusters<-hclust(distance_matrix, method = "complete")
+
+plot(clusters, hang=-1, cex=0.8, main="Hierarchical Clustering of SP500")
+
+#Selecting assets from clusters
+
+#Method 1: Random selection of one asset from each cluster 'K'
+
+# Cut the dendrogram to get 250 clusters
+cluster_cut1<-cutree(clusters, k=L)
+
+# Output the clusters or use them for further analysis
+table(cluster_cut1)
+
+clust1_selection <- sapply(unique(cluster_cut1), function(cluster) {
+  assets_in_cluster <- which(cluster_cut1 == cluster)
+  sample(assets_in_cluster, 1)  # Randomly pick one asset from each cluster
+})
+
+index_returns <- as.matrix(IR)
+asset_returns <- returns_data[, clust1_selection] 
+
+weights<-mse_opt(asset_returns, index_returns)
+
+total_assets <- ncol(returns_data)  # Total assets in the original dataset
+final_portfolio_weights <- rep(0, total_assets)
+
+# Assign the weights to the selected asset positions
+final_portfolio_weights[clust1_selection] <- weights
+
+# Display the final portfolio weights
+return(final_portfolio_weights)
+  
+}
+
+
+#Clustering method 2: Proportional selection of assets based on cluster size (size-weighted representation)
+
+
+clust2<-function(AR, IR, K)
+{
+  #' Hierarchical clustering with proportional representation.
+  #'
+  #' Forms K clusters of assets using correlation distance and complete linkage.
+  #' Instead of picking exactly one per cluster, this method selects a number of assets from each cluster in proportion to
+  #' the cluster’s size relative to the total universe.
+  #' Larger clusters contribute more representatives, smaller clusters fewer.
+  #' Portfolio weights for the selected assets are then computed using mse_opt, and assigned back to the full set of assets.
+  #' 
+  #' Parameters
+  #' ----------
+  #' AR : matrix (T × N)
+  #'   Asset returns.
+  #' IR : vector (T)
+  #'   Index returns.
+  #' K : integer
+  #'   Number of clusters to form.
+  #'
+  #' Returns
+  #' -------
+  #' numeric vector (N)
+  #'   Portfolio weights across all assets, with non-zero weights only for
+  #'   the proportionally selected assets.
+  # -----------------------------------------------------------------
+
+returns_data=as.data.frame(AR)
+returns_data<-returns_data + rnorm(nrow(returns_data), mean = 0, sd = 1e-6)
+
+# Calculate correlation matrix
+correlation_matrix<-cor(returns_data)
+
+# Calculate distance matrix using correlation distance
+distance_matrix<-as.dist(sqrt(2 * (1 - correlation_matrix)))
+
+# Perform hierarchical clustering with complete linkage
+clusters<-hclust(distance_matrix, method = "complete")
+
+plot(clusters, hang=-1, cex=0.8, main="Hierarchical Clustering of SP500")
+
+#Selecting assets from clusters
+
+# Cut the dendrogram to get 150 clusters
+cluster_cut2<-cutree(clusters, k=K)
+
+# Output the clusters or use them for further analysis
+table(cluster_cut2)
+
+total_assets <- length(cluster_cut2)
+
+clust2_selection <- unlist(sapply(unique(cluster_cut2), function(cluster){
+  assets_in_cluster <- which(cluster_cut2 == cluster)
+  num_assets <- round((length(assets_in_cluster) / total_assets) * K)
+  sample(assets_in_cluster, num_assets)
+}))
+
+index_returns <- as.matrix(IR)
+asset_returns <- returns_data[, clust2_selection] 
+
+weights<-mse_opt(asset_returns, index_returns)
+
+total_assets <- ncol(returns_data)  # Total assets in the original dataset
+final_portfolio_weights <- rep(0, total_assets)
+
+# Assign the weights to the selected asset positions
+final_portfolio_weights[clust2_selection] <- weights
+
+# Display the final portfolio weights
+return(final_portfolio_weights)
+  
+}
+
+```
+
+
+Main Script- Rolling window methodology to obtain optimal portfolios from clustering
+
+
+```{r}
+
+start=Sys.time()
+
+for(i in 1:win_count)
+{
+  q=in_sample
+  m1=1+roll*(i-1)
+  m2=q+roll*(i-1)
+  
+  IR=Ind_Ret[c(m1:m2)]
+  AR=Ast_Ret[c(m1:m2), c(1:N)]
+  
+  #Calculating portfolio weights
+  
+  W1[i,]=clust1(AR,IR,K)
+  W2[i,]=clust2(AR,IR,K)
+  
+}
+
+end=Sys.time()
+total=end-start
+total
+  
+```
+
+
+Saving the final portfolio weights as Excel files
+
+
+```{r}
+
+df1=as.data.frame(W1)
+df2=as.data.frame(W2)
+  
+write_xlsx(df1, ".....mention file path to store the weights file.../W_Clust1.xlsx")
+write_xlsx(df2, ".....mention file path to store the weights file.../W_Clust2.xlsx")
+  
+
+```
+
+
