@@ -1,7 +1,6 @@
 ---
 title: "Clustering"
 author: "Vrinda Dhingra"
-date: "2025-08-28"
 output: pdf_document
 ---
 
